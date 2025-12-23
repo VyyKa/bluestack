@@ -482,7 +482,6 @@ services:
     environment:
       PORT: "9002"
 
-
 volumes:
   postgres_data:
   postgres_nginx_love_data:
