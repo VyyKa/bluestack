@@ -1,0 +1,73 @@
+<group name="custom,web,fim,attack_chain,">
+
+  <!-- ================= BASE WEB EVENT ================= -->
+
+  <rule id="100000" level="2">
+    <if_group>json</if_group>
+    <field name="transaction.producer.modsecurity">.</field>
+    <description>ModSecurity log detected</description>
+  </rule>
+
+    <!-- ================= SQL INJECTION ================= -->
+
+  <rule id="100010" level="10">
+    <if_sid>100000</if_sid>
+    <regex>942100|attack-sqli|SQL Injection</regex>
+    <description>SQL Injection attempt detected</description>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+  </rule>
+    <!-- ================= SQL Blocked ================= -->
+  <rule id="100021" level="12">
+    <if_sid>100010</if_sid>
+    <field name="transaction.response.http_code">403</field>
+    <description>SQL Injection blocked by WAF</description>
+  </rule>
+
+    <!-- ================= SQL success ================= -->
+    <rule id="100022" level="8">
+      <if_sid>100010</if_sid>
+      <field name="transaction.response.http_code">200</field>
+      <description>SQL Injection successful (HTTP 200)</description>
+    </rule>
+
+    <!-- ================= FIM ================= -->
+
+  <rule id="100100" level="8">
+    <if_group>syscheck</if_group>
+    <field name="syscheck.event">added</field>
+    <description>File added to system</description>
+  </rule>
+
+  <rule id="100101" level="10">
+    <if_sid>100100</if_sid>
+    <field name="syscheck.path">/dvwa_upload/</field>
+    <description>File uploaded to web directory</description>
+    <mitre>
+      <id>T1505</id>
+    </mitre>
+  </rule>
+
+  <rule id="100102" level="13">
+    <if_sid>100101</if_sid>
+    <field name="syscheck.path">.php</field>
+    <description>Webshell file detected (.php)</description>
+    <mitre>
+      <id>T1505</id>
+    </mitre>
+  </rule>
+
+  <!-- ================= CORRELATION ================= -->
+
+  <rule id="100200" level="15">
+    <if_matched_sid>100010</if_matched_sid>
+    <if_matched_sid>100101</if_matched_sid>
+    <description>ATTACK CHAIN: SQL Injection followed by file upload</description>
+    <mitre>
+      <id>T1190</id>
+      <id>T1505</id>
+    </mitre>
+  </rule>
+
+</group>

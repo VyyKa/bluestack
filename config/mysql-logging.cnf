@@ -1,0 +1,22 @@
+# Comprehensive MySQL logging config for mounting into DVWA container
+[mysqld]
+
+# Error logging
+log_error=/var/log/mysql/error.log
+
+# General query logging (all queries)
+general_log=1
+general_log_file=/var/log/mysql/general.log
+
+# Slow query logging
+slow_query_log=1
+slow_query_log_file=/var/log/mysql/slow.log
+long_query_time=2
+
+# Binary logging (for replication/backup)
+log_bin=/var/log/mysql/mysql-bin.log
+binlog_format=ROW
+
+# Additional logging options
+log_queries_not_using_indexes=1
+log_slow_admin_statements=1
