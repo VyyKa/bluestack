@@ -33,7 +33,7 @@ cd Blueteam_Stack
 
 ### 2️⃣ Create the environment file
 ```bash
-cp .env.example .env
+copy .env.example .env
 ```
 
 ---

@@ -1,13 +1,18 @@
 // http.ingest (raw mode)
+// - Nhận HTTP request -> dump raw HTTP (text) -> forward sang AI_URL.
+// - Không in raw ra stdout trừ khi bật PRINT_RAW=true.
+package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"strings"
@@ -36,9 +41,12 @@ func main() {
 	st := &logState{startedAt: time.Now().UTC()}
 
 	aiURL := strings.TrimSpace(getenv("AI_URL", ""))
+	aiMode := strings.TrimSpace(getenv("AI_MODE", "llamacpp_chat")) // llamacpp_chat | llamacpp_completion | plain
+	aiModel := strings.TrimSpace(getenv("AI_MODEL", "model.gguf"))
+	aiMaxTokens := getenvInt("AI_MAX_TOKENS", 128)
 	resultsFile := strings.TrimSpace(getenv("RESULTS_FILE", ""))
 	queueSize := getenvInt("QUEUE_SIZE", 256)
-	printRaw := strings.EqualFold(getenv("PRINT_RAW", "true"), "true")
+	printRaw := strings.EqualFold(getenv("PRINT_RAW", "false"), "true")
 	printResult := strings.EqualFold(getenv("PRINT_RESULT", "true"), "true")
 
 	var q chan []byte
@@ -47,7 +55,7 @@ func main() {
 			queueSize = 1
 		}
 		q = make(chan []byte, queueSize)
-		go aiWorker(q, aiURL, resultsFile, st, printResult)
+		go aiWorker(q, aiURL, aiMode, aiModel, aiMaxTokens, resultsFile, st, printResult)
 	}
 
 	mux := http.NewServeMux()
@@ -182,9 +190,7 @@ func getenvInt(key string, def int) int {
 	if v == "" {
 		return def
 	}
-	// minimal parse (avoid pulling strconv into earlier diffs? keep it simple)
-	var n int
-	_, err := fmt.Sscanf(v, "%d", &n)
+	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
 		return def
 	}
@@ -192,11 +198,11 @@ func getenvInt(key string, def int) int {
 }
 
 // aiWorker: nhận raw request, POST sang AI_URL, in/ghi kết quả.
-func aiWorker(q <-chan []byte, aiURL string, resultsFile string, st *logState, printResult bool) {
+func aiWorker(q <-chan []byte, aiURL string, aiMode string, aiModel string, aiMaxTokens int, resultsFile string, st *logState, printResult bool) {
 	client := &http.Client{Timeout: 20 * time.Second}
 	for raw := range q {
 		atomic.AddUint64(&st.fwdTotal, 1)
-		respBody, err := callAI(client, aiURL, raw)
+		respBody, err := callAI(client, aiURL, aiMode, aiModel, aiMaxTokens, raw)
 
 		st.mu.Lock()
 		st.lastAIAt = time.Now().UTC()
@@ -224,12 +230,55 @@ func aiWorker(q <-chan []byte, aiURL string, resultsFile string, st *logState, p
 	}
 }
 
-func callAI(client *http.Client, aiURL string, raw []byte) ([]byte, error) {
-	req, err := http.NewRequest("POST", aiURL, bytes.NewReader(raw))
+func callAI(client *http.Client, aiURL string, aiMode string, aiModel string, aiMaxTokens int, raw []byte) ([]byte, error) {
+	return callAIWithMode(client, aiURL, aiMode, aiModel, aiMaxTokens, raw)
+}
+
+func callAIWithMode(client *http.Client, aiURL string, aiMode string, aiModel string, aiMaxTokens int, raw []byte) ([]byte, error) {
+	aiMode = strings.ToLower(strings.TrimSpace(aiMode))
+	var payload []byte
+	var err error
+
+	switch aiMode {
+	case "", "plain":
+		payload = raw
+	case "llamacpp_completion":
+		// POST /completion
+		body := map[string]any{
+			"prompt":    string(raw),
+			"n_predict": aiMaxTokens,
+			"stream":    false,
+		}
+		payload, err = json.Marshal(body)
+	case "llamacpp_chat":
+		// POST /v1/chat/completions (OpenAI-like)
+		body := map[string]any{
+			"model": aiModel,
+			"messages": []map[string]string{
+				{"role": "user", "content": string(raw)},
+			},
+			"max_tokens": aiMaxTokens,
+			"stream":     false,
+		}
+		payload, err = json.Marshal(body)
+	default:
+		return nil, fmt.Errorf("unsupported AI_MODE: %s", aiMode)
+	}
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+
+	req, err := http.NewRequest("POST", aiURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	// Avoid gzip issues with llama.cpp
+	req.Header.Set("Accept-Encoding", "identity")
+	if aiMode == "plain" {
+		req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -261,5 +310,3 @@ func appendResult(path string, data []byte) {
 		_, _ = f.Write([]byte("\n"))
 	}
 }
-
-

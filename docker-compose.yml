@@ -456,7 +456,9 @@ services:
         You are an expert Cybersecurity Analyst.
         Analyze the following HTTP request and return a JSON verdict.
     restart: unless-stopped
-
+    networks:
+      - capstone-dmz-network
+      
   goreplay:
     image: jf7890/goreplay:v1
     container_name: goreplay
@@ -481,6 +483,13 @@ services:
       - "9002:9002"
     environment:
       PORT: "9002"
+      # Forward raw HTTP to internal AI (llama.cpp OpenAI-like API)
+      AI_URL: "http://ai-analyzer:8080/v1/chat/completions"
+      AI_MODE: "llamacpp_chat"
+      AI_MODEL: "model.gguf"
+      AI_MAX_TOKENS: "128"
+      PRINT_RAW: "false"
+      PRINT_RESULT: "true"
 
 volumes:
   postgres_data:

@@ -22,13 +22,9 @@ __pycache__/
 # Local env / secrets (ignore local env files; keep templates)
 .env
 
-# ignore other local env variants but keep templates and universal
+# env variants (do not commit)
 *.env.local
 *.env.*.local
-!.env_example
-!.env.example
-!web-services/env.example
-!web-services/env.universal
 
 # Local scratch files
 Untitled
@@ -40,16 +36,9 @@ Untitled
 /fim/**
 nginx-love-config-backup.json
 
-# Logs and runtime data (keep .gitkeep if present)
-/web-services/logs/
-/web-services/logs/**
-!/web-services/logs/.gitkeep
-
 # Databases / runtime DB files
 *.sqlite
 *.db
-/web-services/logs/sqlite/
-/web-services/logs/sqlite/**
 
 # Docker / compose overrides
 docker-compose.override.yml
