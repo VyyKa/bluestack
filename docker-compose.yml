@@ -446,19 +446,35 @@ services:
       - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     networks:
       - capstone-siem-network
-  ai-analyzer:
-    image: hnquangit/gemma-270m-http-classification
-    container_name: ai-analyzer
-    ports:
-      - "9000:8080"
-    environment:
-      LLAMA_ARG_SYSTEM_PROMPT: >
-        You are an expert Cybersecurity Analyst.
-        Analyze the following HTTP request and return a JSON verdict.
+  # === AI pipeline (Gemma -> Adapter -> http.ingest) ===
+
+  gemma-http:
+    image: hnquangit/gemma-270m-http-classification:latest
+    container_name: gemma-http
     restart: unless-stopped
+    ports:
+      - "8001:8080"
     networks:
-      - capstone-dmz-network
-      
+      - ai-pipe
+
+  http-adapter:
+    build: ./adapter
+    container_name: http-adapter
+    restart: unless-stopped
+    environment:
+      GEMMA_BASE_URL: "http://gemma-http:8080"
+      MODEL_ID: "model.gguf"
+      MAX_SNIPPETS: "5"
+      MAX_TOKENS: "200"
+      TEMPERATURE: "0"
+      TIMEOUT_SECONDS: "60"
+    ports:
+      - "9100:9100"
+    depends_on:
+      - gemma-http
+    networks:
+      - ai-pipe
+
   goreplay:
     image: jf7890/goreplay:v1
     container_name: goreplay
@@ -473,21 +489,24 @@ services:
       - http://http.ingest:9002
       - --output-stdout
     restart: unless-stopped
+
   http.ingest:
-    image: hotailienvykha/http-raw-to-text:latest
+    build: ./http.ingest
     container_name: http-ingest
     restart: unless-stopped
     networks:
       - capstone-dmz-network
+      - ai-pipe
     ports:
       - "9002:9002"
     environment:
       PORT: "9002"
-      # Forward raw HTTP to internal AI (llama.cpp OpenAI-like API)
-      AI_URL: "http://ai-analyzer:8080/v1/chat/completions"
+
+      AI_URL: "http://http-adapter:9100/v1/chat/completions"
       AI_MODE: "llamacpp_chat"
       AI_MODEL: "model.gguf"
       AI_MAX_TOKENS: "128"
+
       PRINT_RAW: "true"
       PRINT_RESULT: "true"
       PRINT_RESULT_FORMAT: "compact"
@@ -536,3 +555,6 @@ volumes:
 networks:
   capstone-siem-network: {}
   capstone-dmz-network: {}
+  ai-pipe:
+    name: ai-pipe
+    driver: bridge
