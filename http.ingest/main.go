@@ -1,6 +1,7 @@
 // http.ingest (raw mode)
-// - Nhận HTTP request -> dump raw HTTP (text) -> forward sang AI_URL.
-// - Không in raw ra stdout trừ khi bật PRINT_RAW=true.
+// - Receive HTTP requests -> dump raw HTTP (text) -> forward to AI_URL (async).
+// - Optionally print RAW REQUEST blocks (PRINT_RAW=true).
+// - Print compact AI RESULT blocks: {"verdict": "...", "snippets":[...]}.
 package main
 
 import (
@@ -19,8 +20,13 @@ import (
 	"time"
 )
 
-// logState: thống kê nhẹ để /logcheck kiểm tra "có đang nhận & log request không".
-// (in-memory, không ghi disk; reset khi container restart)
+// aiCompactResult is what we print in compact mode.
+type aiCompactResult struct {
+	Verdict  string   `json:"verdict"`
+	Snippets []string `json:"snippets,omitempty"`
+}
+
+// logState is in-memory status for /logcheck (resets on container restart).
 type logState struct {
 	startedAt time.Time
 	reqTotal  uint64
@@ -35,19 +41,20 @@ type logState struct {
 	lastAIError string
 }
 
-// main: start HTTP server; nhận request -> dump raw -> enqueue forward AI (không block).
+// main starts the HTTP server and an optional async AI forwarder.
 func main() {
 	port := getenv("PORT", "9002")
 	st := &logState{startedAt: time.Now().UTC()}
 
-	aiURL := strings.TrimSpace(getenv("AI_URL", ""))
-	aiMode := strings.TrimSpace(getenv("AI_MODE", "llamacpp_chat")) // llamacpp_chat | llamacpp_completion | plain
-	aiModel := strings.TrimSpace(getenv("AI_MODEL", "model.gguf"))
+	aiURL := getenv("AI_URL", "")
+	aiMode := getenv("AI_MODE", "llamacpp_chat") // llamacpp_chat | llamacpp_completion | plain
+	aiModel := getenv("AI_MODEL", "model.gguf")
 	aiMaxTokens := getenvInt("AI_MAX_TOKENS", 128)
-	resultsFile := strings.TrimSpace(getenv("RESULTS_FILE", ""))
+	resultsFile := getenv("RESULTS_FILE", "")
 	queueSize := getenvInt("QUEUE_SIZE", 256)
 	printRaw := strings.EqualFold(getenv("PRINT_RAW", "false"), "true")
 	printResult := strings.EqualFold(getenv("PRINT_RESULT", "true"), "true")
+	printResultFormat := getenv("PRINT_RESULT_FORMAT", "compact") // compact | full
 
 	var q chan []byte
 	if aiURL != "" {
@@ -55,7 +62,7 @@ func main() {
 			queueSize = 1
 		}
 		q = make(chan []byte, queueSize)
-		go aiWorker(q, aiURL, aiMode, aiModel, aiMaxTokens, resultsFile, st, printResult)
+		go aiWorker(q, aiURL, aiMode, aiModel, aiMaxTokens, resultsFile, st, printResult, printResultFormat)
 	}
 
 	mux := http.NewServeMux()
@@ -63,11 +70,11 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	// /favicon.ico: browser hay tự request khi mở /logcheck => trả 204 để khỏi nhiễu log.
+	// Browsers may request /favicon.ico automatically; keep logs clean.
 	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	// /logcheck: kiểm tra nhanh tình trạng "log pipeline" (có request nào vào chưa, request gần nhất là gì).
+	// /logcheck returns a small status page for debugging.
 	mux.HandleFunc("/logcheck", func(w http.ResponseWriter, r *http.Request) {
 		now := time.Now().UTC()
 
@@ -159,7 +166,7 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-// dumpRawRequest: dump raw HTTP request (headers + body) bằng stdlib.
+// dumpRawRequest dumps a raw HTTP request (headers + body) using the stdlib.
 func dumpRawRequest(r *http.Request, body []byte) string {
 	rr := new(http.Request)
 	*rr = *r
@@ -175,7 +182,7 @@ func dumpRawRequest(r *http.Request, body []byte) string {
 	return string(b)
 }
 
-// getenv: lấy env var, nếu rỗng thì dùng default.
+// getenv returns an env var, or a default if empty (trimmed).
 func getenv(key, def string) string {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
@@ -184,7 +191,7 @@ func getenv(key, def string) string {
 	return v
 }
 
-// getenvInt: lấy env var kiểu int (invalid/<=0 => default).
+// getenvInt returns an int env var (invalid/<=0 => default).
 func getenvInt(key string, def int) int {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
@@ -197,8 +204,8 @@ func getenvInt(key string, def int) int {
 	return n
 }
 
-// aiWorker: nhận raw request, POST sang AI_URL, in/ghi kết quả.
-func aiWorker(q <-chan []byte, aiURL string, aiMode string, aiModel string, aiMaxTokens int, resultsFile string, st *logState, printResult bool) {
+// aiWorker receives raw HTTP text, POSTs to AI_URL, and prints/stores results.
+func aiWorker(q <-chan []byte, aiURL string, aiMode string, aiModel string, aiMaxTokens int, resultsFile string, st *logState, printResult bool, printResultFormat string) {
 	client := &http.Client{Timeout: 20 * time.Second}
 	for raw := range q {
 		atomic.AddUint64(&st.fwdTotal, 1)
@@ -222,19 +229,135 @@ func aiWorker(q <-chan []byte, aiURL string, aiMode string, aiModel string, aiMa
 		}
 
 		if printResult {
-			_, _ = fmt.Fprintln(os.Stdout, "----- AI RESULT -----")
-			_, _ = fmt.Fprintln(os.Stdout, string(respBody))
-			_, _ = fmt.Fprintln(os.Stdout, "")
+			if strings.EqualFold(printResultFormat, "full") {
+				_, _ = fmt.Fprintln(os.Stdout, "----- AI RESULT -----")
+				_, _ = fmt.Fprintln(os.Stdout, string(respBody))
+				_, _ = fmt.Fprintln(os.Stdout, "")
+			} else {
+				compact := extractVerdictAndSnippets(aiMode, respBody, string(raw))
+				b, _ := json.Marshal(compact)
+				_, _ = fmt.Fprintln(os.Stdout, "----- AI RESULT -----")
+				_, _ = fmt.Fprintln(os.Stdout, string(b))
+				_, _ = fmt.Fprintln(os.Stdout, "")
+			}
 		}
+		// Always store the full response (if RESULTS_FILE is set), even in compact mode.
 		appendResult(resultsFile, respBody)
 	}
 }
 
-func callAI(client *http.Client, aiURL string, aiMode string, aiModel string, aiMaxTokens int, raw []byte) ([]byte, error) {
-	return callAIWithMode(client, aiURL, aiMode, aiModel, aiMaxTokens, raw)
+// extractVerdictAndSnippets parses only verdict+snippets from the AI response.
+// For llamacpp_chat: reads `choices[0].message.content` (expected to be JSON).
+// For llamacpp_completion: reads `content` (expected to be JSON).
+// Fallbacks:
+// - if content isn't JSON -> verdict=content, snippets=[]
+// - if everything empty -> verdict="EMPTY"
+func extractVerdictAndSnippets(aiMode string, respBody []byte, rawRequestText string) aiCompactResult {
+	aiMode = strings.ToLower(strings.TrimSpace(aiMode))
+
+	content := ""
+	switch aiMode {
+	case "llamacpp_chat":
+		var v struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal(respBody, &v) == nil && len(v.Choices) > 0 {
+			content = strings.TrimSpace(v.Choices[0].Message.Content)
+		}
+	case "llamacpp_completion":
+		var v struct {
+			Content string `json:"content"`
+		}
+		if json.Unmarshal(respBody, &v) == nil {
+			content = strings.TrimSpace(v.Content)
+		}
+	default:
+		// plain/unknown: treat the full body as content
+		content = strings.TrimSpace(string(respBody))
+	}
+
+	// If the model returned JSON in content, parse just what we need.
+	var out aiCompactResult
+	if content != "" && json.Unmarshal([]byte(content), &out) == nil && strings.TrimSpace(out.Verdict) != "" {
+		out.Verdict = strings.TrimSpace(out.Verdict)
+		if len(out.Snippets) == 0 {
+			out.Snippets = extractRequestSnippets(rawRequestText)
+		}
+		return out
+	}
+
+	// Fallback: verdict is the content (or response body).
+	fallback := strings.TrimSpace(content)
+	if fallback == "" {
+		fallback = strings.TrimSpace(string(respBody))
+	}
+	if fallback == "" {
+		return aiCompactResult{Verdict: "EMPTY"}
+	}
+	if len(fallback) > 200 {
+		fallback = fallback[:200] + "..."
+	}
+	return aiCompactResult{
+		Verdict:  fallback,
+		Snippets: extractRequestSnippets(rawRequestText),
+	}
 }
 
-func callAIWithMode(client *http.Client, aiURL string, aiMode string, aiModel string, aiMaxTokens int, raw []byte) ([]byte, error) {
+// extractRequestSnippets picks a few meaningful lines from the raw HTTP request text.
+// Intentionally allowlists common, safe headers (no Cookie/Authorization).
+func extractRequestSnippets(raw string) []string {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	lines := strings.Split(raw, "\n")
+
+	// request line
+	var out []string
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		out = append(out, ln)
+		break
+	}
+
+	// allowlisted headers (deterministic order)
+	allow := []string{
+		"host:",
+		"user-agent:",
+		"content-type:",
+		"content-length:",
+		"accept:",
+		"accept-encoding:",
+	}
+	seen := map[string]bool{}
+
+	for _, ln := range lines {
+		lnTrim := strings.TrimSpace(ln)
+		if lnTrim == "" {
+			break // stop at header/body boundary
+		}
+		lower := strings.ToLower(lnTrim)
+		for _, k := range allow {
+			if strings.HasPrefix(lower, k) && !seen[k] {
+				out = append(out, lnTrim)
+				seen[k] = true
+				break
+			}
+		}
+	}
+
+	// keep it short
+	if len(out) > 6 {
+		out = out[:6]
+	}
+	return out
+}
+
+func callAI(client *http.Client, aiURL string, aiMode string, aiModel string, aiMaxTokens int, raw []byte) ([]byte, error) {
 	aiMode = strings.ToLower(strings.TrimSpace(aiMode))
 	var payload []byte
 	var err error
@@ -294,7 +417,7 @@ func callAIWithMode(client *http.Client, aiURL string, aiMode string, aiModel st
 	return b, nil
 }
 
-// appendResult: nếu RESULTS_FILE set thì append vào file (best-effort).
+// appendResult appends to RESULTS_FILE if set (best-effort).
 func appendResult(path string, data []byte) {
 	path = strings.TrimSpace(path)
 	if path == "" {

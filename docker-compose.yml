@@ -488,8 +488,9 @@ services:
       AI_MODE: "llamacpp_chat"
       AI_MODEL: "model.gguf"
       AI_MAX_TOKENS: "128"
-      PRINT_RAW: "false"
+      PRINT_RAW: "true"
       PRINT_RESULT: "true"
+      PRINT_RESULT_FORMAT: "compact"
 
 volumes:
   postgres_data:
